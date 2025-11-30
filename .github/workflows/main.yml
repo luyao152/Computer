@@ -29,28 +29,53 @@ jobs:
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User with Flexible Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          # 方法1：优先使用 GitHub Secrets 中的密码
+          $passwordFromSecret = "${{ secrets.RDP_PASSWORD }}"
+          
+          # 方法2：如果设置了 USE_RANDOM_PASSWORD 变量，使用随机密码
+          $useRandom = "${{ vars.USE_RANDOM_PASSWORD }}"
+          
+          if (-not [string]::IsNullOrWhiteSpace($passwordFromSecret)) {
+              Write-Host "使用 GitHub Secrets 中设置的密码"
+              $password = $passwordFromSecret
+              $passwordSource = "GitHub Secrets"
+          } elseif ($useRandom -eq "true" -or $useRandom -eq "1") {
+              Write-Host "使用随机生成的密码"
+              # 生成包含大小写字母、数字和特殊字符的随机密码
+              $charSet = @{
+                  Upper   = [char[]](65..90)      # A-Z
+                  Lower   = [char[]](97..122)     # a-z
+                  Number  = [char[]](48..57)      # 0-9
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126)) # 特殊字符
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 3
+              $rawPassword += $charSet.Lower | Get-Random -Count 3
+              $rawPassword += $charSet.Number | Get-Random -Count 3
+              $rawPassword += $charSet.Special | Get-Random -Count 3
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
+              $passwordSource = "随机密码"
+          } else {
+              Write-Host "使用固定密码"
+              $password = "Aa147369"
+              $passwordSource = "固定密码"
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          
+          Write-Host "密码来源: $passwordSource"
+          Write-Host "密码长度: $($password.Length) 位"
+          
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # 将密码信息存储到环境变量
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD_SOURCE=$passwordSource" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD_VALUE=$password" >> $env:GITHUB_ENV
           
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
@@ -68,7 +93,7 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
+          # Bring up Tailscale with the provided auth key from secrets
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
@@ -98,16 +123,47 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+      - name: Display Connection Information
+        run: |
+          Write-Host "`n=== RDP 连接信息 ==="
+          Write-Host "地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: RDP"
+          Write-Host "密码: $env:RDP_PASSWORD_VALUE"
+          Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
+          Write-Host "密码长度: $($env:RDP_PASSWORD_VALUE.Length) 位"
+          Write-Host "===================`n"
+          
+          if ($env:RDP_PASSWORD_SOURCE -eq "固定密码") {
+              Write-Host "提示: 当前使用固定密码，建议："
+              Write-Host "1. 在 GitHub Secrets 中设置 RDP_PASSWORD"
+              Write-Host "2. 或在 GitHub Variables 中设置 USE_RANDOM_PASSWORD=true"
+          } elseif ($env:RDP_PASSWORD_SOURCE -eq "随机密码") {
+              Write-Host "提示: 每次运行都会生成新的随机密码，请妥善保存当前密码"
+          }
+
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "`n=== RDP 服务运行中 ==="
+          Write-Host "连接地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: RDP"
+          Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
+          Write-Host "===================`n"
+          Write-Host "提示: 在 GitHub Actions 界面点击 'Cancel workflow' 可终止 RDP 服务"
+          
+          # 计数器，用于定期显示状态
+          $counter = 0
           
           # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              $counter++
+              if ($counter % 6 -eq 0) {  # 每30分钟显示一次完整信息
+                  Write-Host "`n[$(Get-Date)] RDP 服务正常运行中..."
+                  Write-Host "地址: $env:TAILSCALE_IP"
+                  Write-Host "用户名: RDP"
+                  Write-Host "密码: $env:RDP_PASSWORD_VALUE"
+                  Write-Host "使用 Ctrl+C 或点击 Cancel workflow 终止服务`n"
+              } else {
+                  Write-Host "[$(Get-Date)] RDP Active - 运行时间: $($counter * 5) 分钟"
+              }
               Start-Sleep -Seconds 300
           }
