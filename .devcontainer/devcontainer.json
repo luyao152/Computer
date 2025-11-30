@@ -1,0 +1,19 @@
+{
+  "name": "Remote Desktop",
+  "image": "dorowu/ubuntu-desktop-lxde-vnc:latest",
+  "forwardPorts": [80],
+  "portsAttributes": {
+    "80": {
+      "label": "Web Desktop",
+      "onAutoForward": "openPreview"
+    }
+  },
+  "postCreateCommand": "echo '🎉 远程桌面启动成功!' && echo '🖥️ 系统: Ubuntu with LXDE Desktop' && echo '🌐 自动在浏览器中打开桌面' && echo '⏰ 首次启动需要2-3分钟，请耐心等待'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.remote-explorer"
+      ]
+    }
+  }
+}
