@@ -3,8 +3,23 @@ name: RDP
 on:
   workflow_dispatch:
     inputs:
-      rdp_username_input:
-        description: 'RDP 用户名（可选，如不输入将使用 DEFAULT_RDP_USERNAME 变量）'
+      rdp_username:
+        description: '自定义用户名（可选）'
+        required: false
+        default: ''
+        type: string
+      password_mode:
+        description: '密码模式选择'
+        required: true
+        default: 'random'
+        type: choice
+        options:
+          - 'random'
+          - 'secrets'
+          - 'custom'
+          - 'fixed'
+      custom_password:
+        description: '自定义密码（仅在选择自定义密码模式时有效）'
         required: false
         default: ''
         type: string
@@ -38,7 +53,7 @@ jobs:
       - name: Determine RDP Username
         run: |
           # 方法1：优先使用手动输入的用户名
-          $manualUsername = "${{ github.event.inputs.rdp_username_input }}"
+          $manualUsername = "${{ github.event.inputs.rdp_username }}"
           
           # 方法2：如果没有手动输入，使用 Variables 中的预设用户名
           $presetUsername = "${{ vars.DEFAULT_RDP_USERNAME }}"
@@ -73,41 +88,68 @@ jobs:
               Remove-LocalUser -Name $env:RDP_USER -Force
           }
           
-          # 方法1：优先使用 GitHub Secrets 中的密码
-          $passwordFromSecret = "${{ secrets.RDP_PASSWORD }}"
+          # 获取密码模式选择
+          $passwordMode = "${{ github.event.inputs.password_mode }}"
+          $customPasswordInput = "${{ github.event.inputs.custom_password }}"
           
-          # 方法2：如果设置了 USE_RANDOM_PASSWORD 变量，使用随机密码
-          $useRandom = "${{ vars.USE_RANDOM_PASSWORD }}"
-          
-          if (-not [string]::IsNullOrWhiteSpace($passwordFromSecret)) {
-              Write-Host "使用 GitHub Secrets 中设置的密码"
-              $password = $passwordFromSecret
-              $passwordSource = "GitHub Secrets"
-          } elseif ($useRandom -eq "true" -or $useRandom -eq "1") {
-              Write-Host "使用随机生成的密码"
-              # 生成包含大小写字母、数字和特殊字符的随机密码
-              $charSet = @{
-                  Upper   = [char[]](65..90)      # A-Z
-                  Lower   = [char[]](97..122)     # a-z
-                  Number  = [char[]](48..57)      # 0-9
-                  Special = ([char[]](33..47) + [char[]](58..64) +
-                             [char[]](91..96) + [char[]](123..126)) # 特殊字符
+          # 密码选择逻辑（按选择的模式）
+          switch ($passwordMode) {
+              "random" {
+                  Write-Host "使用随机生成的密码"
+                  # 生成包含大小写字母、数字和特殊字符的随机密码
+                  $charSet = @{
+                      Upper   = [char[]](65..90)      # A-Z
+                      Lower   = [char[]](97..122)     # a-z
+                      Number  = [char[]](48..57)      # 0-9
+                      Special = ([char[]](33..47) + [char[]](58..64) +
+                                 [char[]](91..96) + [char[]](123..126)) # 特殊字符
+                  }
+                  $rawPassword = @()
+                  $rawPassword += $charSet.Upper | Get-Random -Count 3
+                  $rawPassword += $charSet.Lower | Get-Random -Count 3
+                  $rawPassword += $charSet.Number | Get-Random -Count 3
+                  $rawPassword += $charSet.Special | Get-Random -Count 3
+                  $password = -join ($rawPassword | Sort-Object { Get-Random })
+                  $passwordSource = "随机密码"
               }
-              $rawPassword = @()
-              $rawPassword += $charSet.Upper | Get-Random -Count 3
-              $rawPassword += $charSet.Lower | Get-Random -Count 3
-              $rawPassword += $charSet.Number | Get-Random -Count 3
-              $rawPassword += $charSet.Special | Get-Random -Count 3
-              $password = -join ($rawPassword | Sort-Object { Get-Random })
-              $passwordSource = "随机密码"
-          } else {
-              Write-Host "使用固定密码"
-              $password = "Aa147369"
-              $passwordSource = "固定密码"
+              "secrets" {
+                  $passwordFromSecret = "${{ secrets.RDP_PASSWORD }}"
+                  if (-not [string]::IsNullOrWhiteSpace($passwordFromSecret)) {
+                      Write-Host "使用 GitHub Secrets 中设置的密码"
+                      $password = $passwordFromSecret
+                      $passwordSource = "GitHub Secrets"
+                  } else {
+                      Write-Host "GitHub Secrets 中未设置 RDP_PASSWORD，回退到固定密码"
+                      $password = "Aa147369"
+                      $passwordSource = "固定密码（Secrets 回退）"
+                  }
+              }
+              "custom" {
+                  if (-not [string]::IsNullOrWhiteSpace($customPasswordInput)) {
+                      Write-Host "使用手动输入的自定义密码"
+                      $password = $customPasswordInput
+                      $passwordSource = "手动输入"
+                  } else {
+                      Write-Host "未输入自定义密码，回退到固定密码"
+                      $password = "Aa147369"
+                      $passwordSource = "固定密码（自定义回退）"
+                  }
+              }
+              "fixed" {
+                  Write-Host "使用固定密码"
+                  $password = "Aa147369"
+                  $passwordSource = "固定密码"
+              }
+              default {
+                  Write-Host "未知密码模式，使用固定密码"
+                  $password = "Aa147369"
+                  $passwordSource = "固定密码（默认）"
+              }
           }
           
           Write-Host "用户名: $env:RDP_USER"
           Write-Host "用户名来源: $env:RDP_USER_SOURCE"
+          Write-Host "密码模式: $passwordMode"
           Write-Host "密码来源: $passwordSource"
           Write-Host "密码: $password"
           Write-Host "密码长度: $($password.Length) 位"
@@ -120,6 +162,7 @@ jobs:
           # 将密码信息存储到环境变量
           echo "RDP_PASSWORD_SOURCE=$passwordSource" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD_VALUE=$password" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD_MODE=$passwordMode" >> $env:GITHUB_ENV
           
           if (-not (Get-LocalUser -Name $env:RDP_USER)) {
               Write-Error "用户创建失败"
@@ -173,17 +216,18 @@ jobs:
           Write-Host "地址: $env:TAILSCALE_IP"
           Write-Host "用户名: $env:RDP_USER"
           Write-Host "用户名来源: $env:RDP_USER_SOURCE"
+          Write-Host "密码模式: $env:RDP_PASSWORD_MODE"
           Write-Host "密码: $env:RDP_PASSWORD_VALUE"
           Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
           Write-Host "密码长度: $($env:RDP_PASSWORD_VALUE.Length) 位"
           Write-Host "===================`n"
           
-          if ($env:RDP_PASSWORD_SOURCE -eq "固定密码") {
-              Write-Host "提示: 当前使用固定密码，建议："
-              Write-Host "1. 在 GitHub Secrets 中设置 RDP_PASSWORD"
-              Write-Host "2. 或在 GitHub Variables 中设置 USE_RANDOM_PASSWORD=true"
-          } elseif ($env:RDP_PASSWORD_SOURCE -eq "随机密码") {
-              Write-Host "提示: 每次运行都会生成新的随机密码，请妥善保存当前密码"
+          switch ($env:RDP_PASSWORD_SOURCE) {
+              "随机密码" { Write-Host "提示: 每次运行都会生成新的随机密码，请妥善保存当前密码" }
+              "GitHub Secrets" { Write-Host "提示: 使用 GitHub Secrets 中预设的安全密码" }
+              "手动输入" { Write-Host "提示: 使用手动输入的自定义密码" }
+              "固定密码" { Write-Host "提示: 使用固定密码，适合临时测试" }
+              { $_ -like "*回退*" } { Write-Host "提示: 原定密码模式不可用，已回退到固定密码" }
           }
 
       - name: Maintain Connection
@@ -192,6 +236,7 @@ jobs:
           Write-Host "连接地址: $env:TAILSCALE_IP"
           Write-Host "用户名: $env:RDP_USER"
           Write-Host "用户名来源: $env:RDP_USER_SOURCE"
+          Write-Host "密码模式: $env:RDP_PASSWORD_MODE"
           Write-Host "密码: $env:RDP_PASSWORD_VALUE"
           Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
           Write-Host "===================`n"
@@ -225,7 +270,7 @@ jobs:
                   Write-Host "`n[$(Get-Date)] RDP 服务正常运行中..."
                   Write-Host "地址: $env:TAILSCALE_IP"
                   Write-Host "用户名: $env:RDP_USER (来源: $env:RDP_USER_SOURCE)"
-                  Write-Host "密码: $env:RDP_PASSWORD_VALUE"
+                  Write-Host "密码: $env:RDP_PASSWORD_VALUE (模式: $env:RDP_PASSWORD_MODE)"
                   Write-Host "运行时间: $minutesRunning 分钟"
                   Write-Host "使用 Ctrl+C 或点击 Cancel workflow 终止服务`n"
               } else {
