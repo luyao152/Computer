@@ -3,7 +3,7 @@ name: RDP
 on:
   workflow_dispatch:
     inputs:
-      rdp_username:
+      rdp_username_input:
         description: 'RDP 用户名（可选，如不输入将使用 DEFAULT_RDP_USERNAME 变量）'
         required: false
         default: ''
@@ -38,7 +38,7 @@ jobs:
       - name: Determine RDP Username
         run: |
           # 方法1：优先使用手动输入的用户名
-          $manualUsername = "${{ github.event.inputs.rdp_username }}"
+          $manualUsername = "${{ github.event.inputs.rdp_username_input }}"
           
           # 方法2：如果没有手动输入，使用 Variables 中的预设用户名
           $presetUsername = "${{ vars.DEFAULT_RDP_USERNAME }}"
