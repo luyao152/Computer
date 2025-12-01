@@ -1,104 +1,97 @@
-name: Permanent RDP Service
+name: RDP
 
 on:
   workflow_dispatch:
     inputs:
-      use_random_password:
-        description: '使用随机密码（覆盖其他设置）'
+      rdp_username:
+        description: 'RDP 用户名（可选，如不输入将使用 DEFAULT_RDP_USERNAME 变量）'
         required: false
-        default: 'false'
-        type: choice
-        options:
-        - 'true'
-        - 'false'
-
-env:
-  RDP_USERNAME: 'RDPUser'
+        default: ''
+        type: string
 
 jobs:
-  permanent-rdp:
-    runs-on: [self-hosted, windows]
-    timeout-minutes: 2592000  # 30天名义值，实际无限
-    
-    steps:
-      - name: Check Runner Environment
-        run: |
-          Write-Host "=== 环境检查 ==="
-          Write-Host "计算机名: $env:COMPUTERNAME"
-          Write-Host "系统版本: $(Get-WmiObject Win32_OperatingSystem).Caption"
-          Write-Host "运行目录: $(Get-Location)"
-          Write-Host "================="
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
 
-      - name: Configure RDP Settings
+    steps:
+      - name: Configure Core RDP Settings
         run: |
-          Write-Host "=== 配置 RDP 设置 ==="
-          
-          # 启用远程桌面
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          Write-Host "✅ 已启用远程桌面"
-          
-          # 配置 RDP 认证设置
+                             -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
+                             -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 0 -Force
-          Write-Host "✅ 已配置 RDP 认证设置"
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
           
-          # 配置防火墙规则
-          netsh advfirewall firewall delete rule name="Permanent-RDP" 2>&1 | Out-Null
-          netsh advfirewall firewall add rule name="Permanent-RDP" `
-            dir=in action=allow protocol=TCP localport=3389 `
-            description="GitHub Actions Permanent RDP Service"
-          Write-Host "✅ 已配置防火墙规则"
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Determine RDP Username
+        run: |
+          # 方法1：优先使用手动输入的用户名
+          $manualUsername = "${{ github.event.inputs.rdp_username }}"
           
-          # 重启远程桌面服务
-          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
-          Start-Service -Name TermService -ErrorAction SilentlyContinue
-          Write-Host "✅ 远程桌面服务已启动"
+          # 方法2：如果没有手动输入，使用 Variables 中的预设用户名
+          $presetUsername = "${{ vars.DEFAULT_RDP_USERNAME }}"
+          
+          # 方法3：如果都没有设置，使用默认用户名
+          if (-not [string]::IsNullOrWhiteSpace($manualUsername)) {
+              Write-Host "使用手动输入的用户名"
+              $username = $manualUsername
+              $usernameSource = "手动输入"
+          } elseif (-not [string]::IsNullOrWhiteSpace($presetUsername)) {
+              Write-Host "使用 Variables 中预设的用户名"
+              $username = $presetUsername
+              $usernameSource = "Variables 预设"
+          } else {
+              Write-Host "使用默认用户名"
+              $username = "RDPUser"
+              $usernameSource = "默认"
+          }
+          
+          Write-Host "最终用户名: $username"
+          Write-Host "用户名来源: $usernameSource"
+          
+          # 将用户名信息存储到环境变量
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_USER_SOURCE=$usernameSource" >> $env:GITHUB_ENV
 
       - name: Create RDP User with Flexible Password
         run: |
-          Write-Host "=== 创建 RDP 用户 ==="
-          
-          # 密码选择逻辑
-          $passwordFromSecret = "${{ secrets.RDP_PASSWORD }}"
-          $useRandomFromInput = "${{ github.event.inputs.use_random_password }}"
-          $useRandomFromVar = "${{ vars.USE_RANDOM_PASSWORD }}"
-          
-          $password = $null
-          $passwordSource = "未知"
-          
-          # 优先级 1: 手动触发输入（最高优先级）
-          if ($useRandomFromInput -eq "true") {
-              Write-Host "🔧 使用手动触发选择的随机密码"
-              $passwordSource = "手动触发随机密码"
+          # 检查用户是否已存在，如果存在则删除
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+              Write-Host "用户 $env:RDP_USER 已存在，删除旧用户"
+              Remove-LocalUser -Name $env:RDP_USER -Force
           }
-          # 优先级 2: GitHub Secrets
-          elseif (-not [string]::IsNullOrWhiteSpace($passwordFromSecret)) {
-              Write-Host "🔐 使用 GitHub Secrets 密码"
+          
+          # 方法1：优先使用 GitHub Secrets 中的密码
+          $passwordFromSecret = "${{ secrets.RDP_PASSWORD }}"
+          
+          # 方法2：如果设置了 USE_RANDOM_PASSWORD 变量，使用随机密码
+          $useRandom = "${{ vars.USE_RANDOM_PASSWORD }}"
+          
+          if (-not [string]::IsNullOrWhiteSpace($passwordFromSecret)) {
+              Write-Host "使用 GitHub Secrets 中设置的密码"
               $password = $passwordFromSecret
               $passwordSource = "GitHub Secrets"
-          }
-          # 优先级 3: GitHub Variables 随机密码
-          elseif ($useRandomFromVar -eq "true" -or $useRandomFromVar -eq "1") {
-              Write-Host "🎲 使用 Variables 设置的随机密码"
-              $passwordSource = "Variables 随机密码"
-          }
-          # 优先级 4: 固定密码
-          else {
-              Write-Host "📝 使用固定密码"
-              $password = "Aa147369"
-              $passwordSource = "固定密码"
-          }
-          
-          # 如果需要生成随机密码
-          if ($passwordSource -like "*随机密码*") {
+          } elseif ($useRandom -eq "true" -or $useRandom -eq "1") {
+              Write-Host "使用随机生成的密码"
+              # 生成包含大小写字母、数字和特殊字符的随机密码
               $charSet = @{
                   Upper   = [char[]](65..90)      # A-Z
                   Lower   = [char[]](97..122)     # a-z
                   Number  = [char[]](48..57)      # 0-9
-                  Special = [char[]](33,35,36,37,38,42,64,94,95) # !#$%&*@^_
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126)) # 特殊字符
               }
               $rawPassword = @()
               $rawPassword += $charSet.Upper | Get-Random -Count 3
@@ -106,200 +99,137 @@ jobs:
               $rawPassword += $charSet.Number | Get-Random -Count 3
               $rawPassword += $charSet.Special | Get-Random -Count 3
               $password = -join ($rawPassword | Sort-Object { Get-Random })
+              $passwordSource = "随机密码"
+          } else {
+              Write-Host "使用固定密码"
+              $password = "Aa147369"
+              $passwordSource = "固定密码"
           }
           
+          Write-Host "用户名: $env:RDP_USER"
+          Write-Host "用户名来源: $env:RDP_USER_SOURCE"
           Write-Host "密码来源: $passwordSource"
-          Write-Host "密码长度: $($password.Length) 字符"
+          Write-Host "密码: $password"
+          Write-Host "密码长度: $($password.Length) 位"
           
-          # 删除已存在的用户（如果存在）
-          $existingUser = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
-          if ($existingUser) {
-              Remove-LocalUser -Name $env:RDP_USERNAME
-              Write-Host "✅ 已删除已存在的用户"
-          }
-          
-          # 创建新用户
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
-          Write-Host "✅ 用户创建成功: $env:RDP_USERNAME"
+          New-LocalUser -Name $env:RDP_USER -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
           
-          # 存储到环境变量
+          # 将密码信息存储到环境变量
           echo "RDP_PASSWORD_SOURCE=$passwordSource" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD_VALUE=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name $env:RDP_USER)) {
+              Write-Error "用户创建失败"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
-          Write-Host "=== 安装 Tailscale ==="
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
           
-          # 检查是否已安装
-          $tsInstalled = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Tailscale*" }
-          if ($tsInstalled) {
-              Write-Host "✅ Tailscale 已安装，跳过安装"
-          } else {
-              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-              $installerPath = "$env:TEMP\tailscale-latest.msi"
-              
-              Write-Host "下载 Tailscale..."
-              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-              
-              Write-Host "安装 Tailscale..."
-              Start-Process msiexec.exe -Wait -ArgumentList @(
-                  "/i", "`"$installerPath`"",
-                  "/quiet",
-                  "/norestart",
-                  "LAUNCHAPP=0"
-              )
-              
-              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-              Write-Host "✅ Tailscale 安装完成"
-          }
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          Write-Host "=== 建立 Tailscale 连接 ==="
+          # Bring up Tailscale with the provided auth key from secrets
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tailscaleExe)) {
-              $tailscaleExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
-          }
-          
-          if (-not (Test-Path $tailscaleExe)) {
-              Write-Error "❌ 找不到 Tailscale 可执行文件"
-              exit 1
-          }
-          
-          # 启动 Tailscale
-          Write-Host "启动 Tailscale 连接..."
-          & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=perm-rdp-$env:COMPUTERNAME --accept-routes
-          
-          # 等待获取 IP
-          Write-Host "等待 IP 分配..."
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
-          $maxRetries = 12
-          $retryCount = 0
-          
-          while (-not $tsIP -and $retryCount -lt $maxRetries) {
-              $tsIP = & $tailscaleExe ip -4
-              if (-not $tsIP) {
-                  $retryCount++
-                  Write-Host "第 $retryCount/$maxRetries 次尝试..."
-                  Start-Sleep -Seconds 10
-              }
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
           
           if (-not $tsIP) {
-              Write-Error "❌ Tailscale IP 分配失败"
+              Write-Error "Tailscale IP 未分配，退出"
               exit 1
           }
-          
-          Write-Host "✅ Tailscale IP: $tsIP"
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
+      
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "=== 验证 RDP 可访问性 ==="
-          Write-Host "目标 IP: $env:TAILSCALE_IP"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # 测试本地 RDP 服务
-          $localTest = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
-          if ($localTest) {
-              Write-Host "✅ 本地 RDP 服务正在监听"
-          } else {
-              Write-Error "❌ 本地 RDP 服务未启动"
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP 连接到 RDP 端口 3389 失败"
               exit 1
           }
-          
-          # 测试网络连通性（通过 Tailscale）
-          Write-Host "测试网络连通性..."
-          $pingResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          if ($pingResult) {
-              Write-Host "✅ RDP 端口连通性测试成功"
-          } else {
-              Write-Host "⚠️  直接端口测试失败，尝试其他方法..."
-              # 可能是防火墙阻止，但服务可能仍在运行
-          }
-          
-          Write-Host "✅ RDP 服务验证完成"
+          Write-Host "TCP 连接测试成功！"
 
       - name: Display Connection Information
         run: |
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "🎉 PERMANENT RDP 服务已启动！"
-          Write-Host "================================================"
-          Write-Host "🌐 连接地址: $env:TAILSCALE_IP"
-          Write-Host "👤 用户名: $env:RDP_USERNAME"
-          Write-Host "🔑 密码: $env:RDP_PASSWORD_VALUE"
-          Write-Host "📝 密码来源: $env:RDP_PASSWORD_SOURCE"
-          Write-Host "💻 计算机名: $env:COMPUTERNAME"
-          Write-Host "🕒 启动时间: $(Get-Date)"
-          Write-Host "================================================"
-          Write-Host ""
-          Write-Host "📋 使用说明:"
-          Write-Host "   1. 使用远程桌面连接工具"
-          Write-Host "   2. 输入上述地址和凭据"
-          Write-Host "   3. 享受永久 RDP 访问！"
-          Write-Host ""
-          Write-Host "⏹️  停止服务:"
-          Write-Host "   - 在 GitHub Actions 界面点击 'Cancel workflow'"
-          Write-Host "   - 或停止服务器上的 GitHub Runner 服务"
-          Write-Host "================================================"
+          Write-Host "`n=== RDP 连接信息 ==="
+          Write-Host "地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: $env:RDP_USER"
+          Write-Host "用户名来源: $env:RDP_USER_SOURCE"
+          Write-Host "密码: $env:RDP_PASSWORD_VALUE"
+          Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
+          Write-Host "密码长度: $($env:RDP_PASSWORD_VALUE.Length) 位"
+          Write-Host "===================`n"
+          
+          if ($env:RDP_PASSWORD_SOURCE -eq "固定密码") {
+              Write-Host "提示: 当前使用固定密码，建议："
+              Write-Host "1. 在 GitHub Secrets 中设置 RDP_PASSWORD"
+              Write-Host "2. 或在 GitHub Variables 中设置 USE_RANDOM_PASSWORD=true"
+          } elseif ($env:RDP_PASSWORD_SOURCE -eq "随机密码") {
+              Write-Host "提示: 每次运行都会生成新的随机密码，请妥善保存当前密码"
+          }
 
-      - name: Maintain Permanent Connection
+      - name: Maintain Connection
         run: |
-          Write-Host "=== 进入永久运行模式 ==="
-          Write-Host "此步骤将保持 RDP 服务无限期运行"
-          Write-Host "要停止服务，请在 GitHub Actions 界面点击 'Cancel workflow'"
-          Write-Host ""
+          Write-Host "`n=== RDP 服务运行中 ==="
+          Write-Host "连接地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: $env:RDP_USER"
+          Write-Host "用户名来源: $env:RDP_USER_SOURCE"
+          Write-Host "密码: $env:RDP_PASSWORD_VALUE"
+          Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
+          Write-Host "===================`n"
+          Write-Host "提示: 在 GitHub Actions 界面点击 'Cancel workflow' 可终止 RDP 服务"
           
-          # 无限循环开始 - 这是实现"无限使用"的核心
-          $startTime = Get-Date
-          $checkCount = 0
-          $lastStatusTime = Get-Date
+          # 时间提醒计数器
+          $counter = 0
+          $reminderShown = @()
           
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              $currentTime = Get-Date
-              $runningTime = $currentTime - $startTime
-              $checkCount++
+              $counter++
+              $minutesRunning = $counter * 5
               
-              # 每5分钟显示详细状态
-              if (($currentTime - $lastStatusTime).TotalMinutes -ge 5) {
-                  Write-Host ""
-                  Write-Host "=== RDP 服务状态更新 ==="
-                  Write-Host "运行时间: $([math]::Round($runningTime.TotalHours, 1)) 小时"
-                  Write-Host "检查次数: $checkCount"
-                  Write-Host "服务器时间: $currentTime"
-                  Write-Host "连接地址: $env:TAILSCALE_IP"
-                  Write-Host "用户名: $env:RDP_USERNAME"
-                  Write-Host "密码来源: $env:RDP_PASSWORD_SOURCE"
-                  Write-Host "=========================="
-                  Write-Host ""
-                  $lastStatusTime = $currentTime
+              # 时间提醒
+              if ($minutesRunning -eq 60 -and "1hour" -notin $reminderShown) {
+                  Write-Host "⏰ 提醒: 已运行1小时，剩余5小时"
+                  $reminderShown += "1hour"
+              }
+              elseif ($minutesRunning -eq 180 -and "3hour" -notin $reminderShown) {
+                  Write-Host "⏰ 提醒: 已运行3小时，剩余3小时"
+                  $reminderShown += "3hour"
+              }
+              elseif ($minutesRunning -eq 300 -and "5hour" -notin $reminderShown) {
+                  Write-Host "🚨 提醒: 剩余1小时，请保存工作！"
+                  $reminderShown += "5hour"
               }
               
-              # 简单心跳（每分钟）
-              if ($checkCount % 12 -eq 0) {
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ♥ RDP 服务正常运行 - 总运行: $([math]::Round($runningTime.TotalHours, 1))h"
+              # 定期状态显示（每30分钟显示完整信息包括密码）
+              if ($counter % 6 -eq 0) {
+                  Write-Host "`n[$(Get-Date)] RDP 服务正常运行中..."
+                  Write-Host "地址: $env:TAILSCALE_IP"
+                  Write-Host "用户名: $env:RDP_USER (来源: $env:RDP_USER_SOURCE)"
+                  Write-Host "密码: $env:RDP_PASSWORD_VALUE"
+                  Write-Host "运行时间: $minutesRunning 分钟"
+                  Write-Host "使用 Ctrl+C 或点击 Cancel workflow 终止服务`n"
+              } else {
+                  Write-Host "[$(Get-Date)] RDP Active - 运行时间: $minutesRunning 分钟"
               }
-              
-              # 检查服务状态（每10次循环）
-              if ($checkCount % 10 -eq 0) {
-                  $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                  $tailscaleProcess = Get-Process -Name tailscale -ErrorAction SilentlyContinue
-                  
-                  if ($rdpService.Status -ne "Running") {
-                      Write-Host "⚠️  RDP 服务异常，尝试重启..."
-                      Start-Service -Name TermService -ErrorAction SilentlyContinue
-                  }
-                  
-                  if (-not $tailscaleProcess) {
-                      Write-Host "⚠️  Tailscale 未运行，尝试重启..."
-                      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
-                  }
-              }
-              
-              # 等待 5 秒后继续循环
-              Start-Sleep -Seconds 5
+              Start-Sleep -Seconds 300
           }
